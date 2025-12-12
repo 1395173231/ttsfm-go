@@ -21,8 +21,8 @@ type SpeechRequest struct {
 	Instructions   string  `json:"instructions"`
 	Speed          float64 `json:"speed"`
 
-	AutoCombine bool `json:"auto_combine"`
-	MaxLength   int  `json:"max_length"`
+	AutoCombine *bool `json:"auto_combine,omitempty"`
+	MaxLength   int   `json:"max_length"`
 }
 
 // ErrorResponse 错误响应（OpenAI 风格）
@@ -44,22 +44,22 @@ type SpeechClient interface {
 
 // Handler 处理器
 type Handler struct {
-	client      SpeechClient
-	logger      ttsfm.Logger
-	timeout     time.Duration
-	AutoCombine bool
+	client             SpeechClient
+	logger             ttsfm.Logger
+	timeout            time.Duration
+	autoCombineDefault bool
 }
 
 // NewHandler 创建处理器
-func NewHandler(client SpeechClient, logger ttsfm.Logger, timeout time.Duration, AutoCombine bool) *Handler {
+func NewHandler(client SpeechClient, logger ttsfm.Logger, timeout time.Duration, autoCombineDefault bool) *Handler {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	return &Handler{
-		client:      client,
-		logger:      logger,
-		timeout:     timeout,
-		AutoCombine: AutoCombine,
+		client:             client,
+		logger:             logger,
+		timeout:            timeout,
+		autoCombineDefault: autoCombineDefault,
 	}
 }
 
@@ -88,7 +88,11 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 	if req.MaxLength == 0 {
 		req.MaxLength = 4096
 	}
-	req.AutoCombine = h.AutoCombine
+
+	autoCombine := h.autoCombineDefault
+	if req.AutoCombine != nil {
+		autoCombine = *req.AutoCombine
+	}
 
 	// auto_combine 默认：当文本不超长时可认为“无需分片”，这里不强制开启。
 	// 只有当超长且 auto_combine=true 才会自动分割+合并。
@@ -128,19 +132,19 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 	}
 
 	h.info("OpenAI API: Generating speech: text='%s...', voice=%s, format=%s, auto_combine=%v, max_length=%d",
-		truncateString(req.Input, 50), req.Voice, req.ResponseFormat, req.AutoCombine, req.MaxLength)
+		truncateString(req.Input, 50), req.Voice, req.ResponseFormat, autoCombine, req.MaxLength)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.timeout)
 	defer cancel()
 
 	textLength := len(req.Input)
 
-	if textLength > req.MaxLength && req.AutoCombine {
+	if textLength > req.MaxLength && autoCombine {
 		h.handleLongText(c, ctx, &req, voice, format)
 		return
 	}
 
-	if textLength > req.MaxLength && !req.AutoCombine {
+	if textLength > req.MaxLength && !autoCombine {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: ErrorDetail{
 				Message: fmt.Sprintf(
@@ -155,7 +159,7 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 		return
 	}
 
-	h.handleShortText(c, ctx, &req, voice, format)
+	h.handleShortText(c, ctx, &req, voice, format, autoCombine)
 }
 
 func (h *Handler) handleLongText(
@@ -204,7 +208,7 @@ func (h *Handler) handleLongText(
 	actualFormat := responses[0].Format
 	contentType := responses[0].ContentType
 
-	combinedAudio, err := ttsfm.CombineAudioChunks(chunks, string(actualFormat))
+	combinedAudio, err := ttsfm.CombineAudioChunks(chunks, actualFormat)
 	if err != nil {
 		h.error("Failed to combine audio chunks: %v", err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
@@ -237,6 +241,7 @@ func (h *Handler) handleShortText(
 	req *SpeechRequest,
 	voice ttsfm.Voice,
 	format ttsfm.AudioFormat,
+	autoCombine bool,
 ) {
 	opts := []ttsfm.RequestOption{
 		ttsfm.WithVoice(voice),
@@ -261,7 +266,7 @@ func (h *Handler) handleShortText(
 	c.Header("X-Audio-Format", string(response.Format))
 	c.Header("X-Audio-Size", strconv.Itoa(response.Size))
 	c.Header("X-Chunks-Combined", "1")
-	c.Header("X-Auto-Combine", fmt.Sprintf("%v", req.AutoCombine))
+	c.Header("X-Auto-Combine", fmt.Sprintf("%v", autoCombine))
 	c.Header("X-Powered-By", "TTSFM-OpenAI-Compatible")
 
 	c.Data(http.StatusOK, response.ContentType, response.AudioData)

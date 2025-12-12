@@ -8,29 +8,29 @@ import (
 )
 
 // CombineAudioChunks 合并多个音频块
-func CombineAudioChunks(chunks [][]byte, format string) ([]byte, error) {
+func CombineAudioChunks(chunks [][]byte, format AudioFormat) ([]byte, error) {
 	if len(chunks) == 0 {
 		return nil, fmt.Errorf("no audio chunks to combine")
 	}
-
 	if len(chunks) == 1 {
 		return chunks[0], nil
 	}
 
 	switch format {
-	case "mp3":
+	case FormatMP3:
 		return combineMP3Chunks(chunks)
-	case "wav":
+	case FormatWAV:
 		return combineWAVChunks(chunks)
+	case FormatOPUS, FormatAAC, FormatFLAC, FormatPCM:
+		return combineRawChunks(chunks)
 	default:
-		return combineRawChunks(chunks), nil
+		return combineRawChunks(chunks)
 	}
 }
 
-// combineMP3Chunks 合并 MP3 音频块
-// MP3 文件可以简单拼接（除去后续块可能包含的 ID3 标签）
+// combineMP3Chunks 合并 MP3 音频块（帧可直接拼接）
 func combineMP3Chunks(chunks [][]byte) ([]byte, error) {
-	var result bytes.Buffer
+	var buffer bytes.Buffer
 
 	for i, chunk := range chunks {
 		if len(chunk) == 0 {
@@ -42,10 +42,10 @@ func combineMP3Chunks(chunks [][]byte) ([]byte, error) {
 			data = skipID3Tag(data)
 		}
 
-		_, _ = result.Write(data)
+		_, _ = buffer.Write(data)
 	}
 
-	return result.Bytes(), nil
+	return buffer.Bytes(), nil
 }
 
 // skipID3Tag 跳过 ID3v2 标签（若存在）
@@ -55,13 +55,9 @@ func skipID3Tag(data []byte) []byte {
 	}
 
 	if data[0] == 'I' && data[1] == 'D' && data[2] == '3' {
+		// ID3v2 size 使用 syncsafe integer（不包含 10 字节 header）
 		size := int(data[6])<<21 | int(data[7])<<14 | int(data[8])<<7 | int(data[9])
 		totalSize := size + 10
-
-		if data[5]&0x10 != 0 {
-			totalSize += 10
-		}
-
 		if totalSize < len(data) {
 			return data[totalSize:]
 		}
@@ -70,28 +66,34 @@ func skipID3Tag(data []byte) []byte {
 	return data
 }
 
-// combineWAVChunks 合并 WAV 音频块
+// combineWAVChunks 合并 WAV 音频块（需重建 WAV 头并更新数据长度）
 func combineWAVChunks(chunks [][]byte) ([]byte, error) {
-	if len(chunks) == 0 {
-		return nil, fmt.Errorf("no chunks to combine")
-	}
-
 	firstHeader, err := parseWAVHeader(chunks[0])
 	if err != nil {
-		return combineRawChunks(chunks), nil
+		// 不是标准 WAV（或返回格式不一致）时退回到原始拼接
+		return combineRawChunks(chunks)
 	}
 
 	var audioData bytes.Buffer
 	for _, chunk := range chunks {
 		data, err := extractWAVData(chunk)
 		if err != nil {
+			// 如果 chunk 看起来像 WAV 但提取失败，直接返回错误避免输出不可播放文件
+			if looksLikeWAV(chunk) {
+				return nil, fmt.Errorf("failed to extract wav data: %w", err)
+			}
+			// 否则当作纯音频数据拼接（极少数服务可能返回裸 PCM）
 			_, _ = audioData.Write(chunk)
-		} else {
-			_, _ = audioData.Write(data)
+			continue
 		}
+		_, _ = audioData.Write(data)
 	}
 
-	return createWAVFile(firstHeader, audioData.Bytes())
+	return buildWAVFile(firstHeader, audioData.Bytes())
+}
+
+func looksLikeWAV(data []byte) bool {
+	return len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WAVE"
 }
 
 // WAVHeader WAV 文件头信息
@@ -109,11 +111,11 @@ func parseWAVHeader(data []byte) (*WAVHeader, error) {
 	if len(data) < 44 {
 		return nil, fmt.Errorf("data too short for WAV header")
 	}
-
-	if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+	if !looksLikeWAV(data) {
 		return nil, fmt.Errorf("not a valid WAV file")
 	}
 
+	// 查找 fmt chunk
 	offset := 12
 	for offset < len(data)-8 {
 		chunkID := string(data[offset : offset+4])
@@ -123,19 +125,18 @@ func parseWAVHeader(data []byte) (*WAVHeader, error) {
 			if offset+8+int(chunkSize) > len(data) {
 				return nil, fmt.Errorf("fmt chunk extends beyond file")
 			}
-
-			fmtData := data[offset+8 : offset+8+int(chunkSize)]
-			if len(fmtData) < 16 {
+			if chunkSize < 16 {
 				return nil, fmt.Errorf("fmt chunk too small")
 			}
 
+			base := offset + 8
 			return &WAVHeader{
-				AudioFormat:   binary.LittleEndian.Uint16(fmtData[0:2]),
-				NumChannels:   binary.LittleEndian.Uint16(fmtData[2:4]),
-				SampleRate:    binary.LittleEndian.Uint32(fmtData[4:8]),
-				ByteRate:      binary.LittleEndian.Uint32(fmtData[8:12]),
-				BlockAlign:    binary.LittleEndian.Uint16(fmtData[12:14]),
-				BitsPerSample: binary.LittleEndian.Uint16(fmtData[14:16]),
+				AudioFormat:   binary.LittleEndian.Uint16(data[base : base+2]),
+				NumChannels:   binary.LittleEndian.Uint16(data[base+2 : base+4]),
+				SampleRate:    binary.LittleEndian.Uint32(data[base+4 : base+8]),
+				ByteRate:      binary.LittleEndian.Uint32(data[base+8 : base+12]),
+				BlockAlign:    binary.LittleEndian.Uint16(data[base+12 : base+14]),
+				BitsPerSample: binary.LittleEndian.Uint16(data[base+14 : base+16]),
 			}, nil
 		}
 
@@ -148,10 +149,13 @@ func parseWAVHeader(data []byte) (*WAVHeader, error) {
 	return nil, fmt.Errorf("fmt chunk not found")
 }
 
-// extractWAVData 提取 WAV 音频数据
+// extractWAVData 从 WAV 文件中提取音频 data chunk
 func extractWAVData(data []byte) ([]byte, error) {
 	if len(data) < 44 {
 		return nil, fmt.Errorf("data too short")
+	}
+	if !looksLikeWAV(data) {
+		return nil, fmt.Errorf("not a WAV file")
 	}
 
 	offset := 12
@@ -177,88 +181,160 @@ func extractWAVData(data []byte) ([]byte, error) {
 	return nil, fmt.Errorf("data chunk not found")
 }
 
-// createWAVFile 创建 WAV 文件
-func createWAVFile(header *WAVHeader, audioData []byte) ([]byte, error) {
+// buildWAVFile 构建 WAV 文件
+func buildWAVFile(header *WAVHeader, audioData []byte) ([]byte, error) {
 	var buf bytes.Buffer
 
 	dataSize := uint32(len(audioData))
 	fileSize := 36 + dataSize
 
 	buf.WriteString("RIFF")
-	_ = binary.Write(&buf, binary.LittleEndian, fileSize)
+	if err := binary.Write(&buf, binary.LittleEndian, fileSize); err != nil {
+		return nil, err
+	}
 	buf.WriteString("WAVE")
 
 	buf.WriteString("fmt ")
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))
-	_ = binary.Write(&buf, binary.LittleEndian, header.AudioFormat)
-	_ = binary.Write(&buf, binary.LittleEndian, header.NumChannels)
-	_ = binary.Write(&buf, binary.LittleEndian, header.SampleRate)
-	_ = binary.Write(&buf, binary.LittleEndian, header.ByteRate)
-	_ = binary.Write(&buf, binary.LittleEndian, header.BlockAlign)
-	_ = binary.Write(&buf, binary.LittleEndian, header.BitsPerSample)
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(16)); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.AudioFormat); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.NumChannels); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.SampleRate); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.ByteRate); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.BlockAlign); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, header.BitsPerSample); err != nil {
+		return nil, err
+	}
 
 	buf.WriteString("data")
-	_ = binary.Write(&buf, binary.LittleEndian, dataSize)
-	_, _ = buf.Write(audioData)
+	if err := binary.Write(&buf, binary.LittleEndian, dataSize); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(audioData); err != nil {
+		return nil, err
+	}
 
 	return buf.Bytes(), nil
 }
 
 // combineRawChunks 简单拼接音频块
-func combineRawChunks(chunks [][]byte) []byte {
-	var result bytes.Buffer
+func combineRawChunks(chunks [][]byte) ([]byte, error) {
+	var buffer bytes.Buffer
 	for _, chunk := range chunks {
-		_, _ = result.Write(chunk)
+		_, _ = buffer.Write(chunk)
 	}
-	return result.Bytes()
+	return buffer.Bytes(), nil
 }
 
-// AudioCombiner 音频合并器接口
-type AudioCombiner interface {
-	Combine(chunks [][]byte) ([]byte, error)
+// GetAudioDuration 估算音频时长（秒）
+func GetAudioDuration(data []byte, format AudioFormat) (float64, error) {
+	switch format {
+	case FormatWAV:
+		return getWAVDuration(data)
+	case FormatMP3:
+		return estimateMP3Duration(data)
+	default:
+		return 0, fmt.Errorf("unsupported format for duration calculation")
+	}
 }
 
-// StreamingAudioCombiner 流式音频合并器
-type StreamingAudioCombiner struct {
-	format string
-	buffer bytes.Buffer
-	count  int
+func getWAVDuration(data []byte) (float64, error) {
+	header, err := parseWAVHeader(data)
+	if err != nil {
+		return 0, err
+	}
+
+	audio, err := extractWAVData(data)
+	if err != nil {
+		return 0, err
+	}
+
+	if header.ByteRate == 0 {
+		return 0, fmt.Errorf("invalid byte rate")
+	}
+
+	return float64(len(audio)) / float64(header.ByteRate), nil
 }
 
-// NewStreamingAudioCombiner 创建流式合并器
-func NewStreamingAudioCombiner(format string) *StreamingAudioCombiner {
-	return &StreamingAudioCombiner{
+func estimateMP3Duration(data []byte) (float64, error) {
+	// 估算：假设 128kbps
+	const bytesPerSecond = 128000.0 / 8.0
+	if bytesPerSecond == 0 {
+		return 0, fmt.Errorf("invalid bitrate")
+	}
+	return float64(len(data)) / bytesPerSecond, nil
+}
+
+// ValidateAudioData 粗略验证合并后的音频数据
+func ValidateAudioData(data []byte, format AudioFormat) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty audio data")
+	}
+
+	switch format {
+	case FormatMP3:
+		return validateMP3(data)
+	case FormatWAV:
+		return validateWAV(data)
+	default:
+		return nil
+	}
+}
+
+func validateMP3(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("data too short for MP3")
+	}
+
+	// ID3v2
+	if data[0] == 'I' && data[1] == 'D' && data[2] == '3' {
+		return nil
+	}
+
+	// MP3 frame sync: 0xFFEx
+	if data[0] == 0xFF && (data[1]&0xE0) == 0xE0 {
+		return nil
+	}
+
+	return fmt.Errorf("invalid MP3 data")
+}
+
+func validateWAV(data []byte) error {
+	if len(data) < 12 {
+		return fmt.Errorf("data too short for WAV")
+	}
+	if !looksLikeWAV(data) {
+		return fmt.Errorf("invalid WAV header")
+	}
+	return nil
+}
+
+// AudioReader 音频流读取器
+type AudioReader struct {
+	reader io.Reader
+	format AudioFormat
+}
+
+// NewAudioReader 创建音频读取器
+func NewAudioReader(r io.Reader, format AudioFormat) *AudioReader {
+	return &AudioReader{
+		reader: r,
 		format: format,
 	}
 }
 
-// Add 添加音频块
-func (c *StreamingAudioCombiner) Add(chunk []byte) error {
-	if len(chunk) == 0 {
-		return nil
-	}
-
-	if c.format == "mp3" && c.count > 0 {
-		chunk = skipID3Tag(chunk)
-	}
-
-	_, _ = c.buffer.Write(chunk)
-	c.count++
-	return nil
-}
-
-// Result 获取合并结果
-func (c *StreamingAudioCombiner) Result() []byte {
-	return c.buffer.Bytes()
-}
-
-// Count 获取块数量
-func (c *StreamingAudioCombiner) Count() int {
-	return c.count
-}
-
-// WriteTo 写入到 Writer
-func (c *StreamingAudioCombiner) WriteTo(w io.Writer) (int64, error) {
-	n, err := w.Write(c.buffer.Bytes())
-	return int64(n), err
+// ReadAll 读取所有音频数据
+func (ar *AudioReader) ReadAll() ([]byte, error) {
+	return io.ReadAll(ar.reader)
 }

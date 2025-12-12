@@ -83,7 +83,7 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		config:    config,
 		engine:    engine,
 		ttsClient: ttsClient,
-		handler:   NewHandler(ttsClient, config.Logger, config.RequestTimeout),
+		handler:   NewHandler(ttsClient, config.Logger, config.RequestTimeout, config.AutoCombine),
 		logger:    config.Logger,
 	}
 

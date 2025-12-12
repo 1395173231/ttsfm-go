@@ -55,7 +55,7 @@ func doJSONPost(t *testing.T, r http.Handler, path string, body any) *httptest.R
 }
 
 func TestOpenAISpeech_MissingInput(t *testing.T) {
-	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second)
+	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second, true)
 	engine := newTestEngine(handler)
 
 	w := doJSONPost(t, engine, "/v1/audio/speech", map[string]any{
@@ -72,7 +72,7 @@ func TestOpenAISpeech_MissingInput(t *testing.T) {
 }
 
 func TestOpenAISpeech_InvalidVoice(t *testing.T) {
-	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second)
+	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second, true)
 	engine := newTestEngine(handler)
 
 	w := doJSONPost(t, engine, "/v1/audio/speech", map[string]any{
@@ -90,7 +90,7 @@ func TestOpenAISpeech_InvalidVoice(t *testing.T) {
 }
 
 func TestOpenAISpeech_InvalidFormat(t *testing.T) {
-	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second)
+	handler := NewHandler(&mockSpeechClient{}, &ttsfm.DefaultLogger{}, 2*time.Second, true)
 	engine := newTestEngine(handler)
 
 	w := doJSONPost(t, engine, "/v1/audio/speech", map[string]any{
@@ -123,7 +123,7 @@ func TestOpenAISpeech_ShortText_OK(t *testing.T) {
 		},
 	}
 
-	handler := NewHandler(mockClient, &ttsfm.DefaultLogger{}, 2*time.Second)
+	handler := NewHandler(mockClient, &ttsfm.DefaultLogger{}, 2*time.Second, true)
 	engine := newTestEngine(handler)
 
 	w := doJSONPost(t, engine, "/v1/audio/speech", map[string]any{
@@ -176,7 +176,7 @@ func TestOpenAISpeech_LongText_AutoCombine_OK(t *testing.T) {
 		},
 	}
 
-	handler := NewHandler(mockClient, &ttsfm.DefaultLogger{}, 2*time.Second)
+	handler := NewHandler(mockClient, &ttsfm.DefaultLogger{}, 2*time.Second, true)
 	engine := newTestEngine(handler)
 
 	w := doJSONPost(t, engine, "/v1/audio/speech", map[string]any{
