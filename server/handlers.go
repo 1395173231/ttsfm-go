@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,9 +38,11 @@ type ErrorDetail struct {
 	Code    string `json:"code"`
 }
 
-// SpeechClient 抽象客户端，便于测试 mock
+// SpeechClient 抽象客户端接口（支持流式）
 type SpeechClient interface {
-	GenerateSpeech(ctx context.Context, text string, opts ...ttsfm.RequestOption) (*ttsfm.TTSResponse, error)
+	// 流式方法
+	GenerateSpeechStream(ctx context.Context, text string, opts ...ttsfm.RequestOption) (*ttsfm.TTSStreamResponse, error)
+	// 非流式方法（长文本需要）
 	GenerateSpeechLongText(ctx context.Context, text string, maxLength int, preserveWords bool, opts ...ttsfm.RequestOption) ([]*ttsfm.TTSResponse, error)
 }
 
@@ -94,8 +98,6 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 		autoCombine = *req.AutoCombine
 	}
 
-	// auto_combine 默认：当文本不超长时可认为“无需分片”，这里不强制开启。
-	// 只有当超长且 auto_combine=true 才会自动分割+合并。
 	if strings.TrimSpace(req.Input) == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: ErrorDetail{
@@ -134,12 +136,12 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 	h.info("OpenAI API: Generating speech: text='%s...', voice=%s, format=%s, auto_combine=%v, max_length=%d",
 		truncateString(req.Input, 50), req.Voice, req.ResponseFormat, autoCombine, req.MaxLength)
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), h.timeout)
-	defer cancel()
+	ctx := c.Request.Context()
 
 	textLength := len(req.Input)
 
 	if textLength > req.MaxLength && autoCombine {
+		// 长文本需要分片处理，无法完全流式
 		h.handleLongText(c, ctx, &req, voice, format)
 		return
 	}
@@ -159,7 +161,59 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 		return
 	}
 
-	h.handleShortText(c, ctx, &req, voice, format, autoCombine)
+	// 短文本使用流式处理
+	h.handleShortTextStream(c, ctx, &req, voice, format, autoCombine)
+}
+
+// handleShortTextStream 流式处理短文本
+func (h *Handler) handleShortTextStream(
+	c *gin.Context,
+	ctx context.Context,
+	req *SpeechRequest,
+	voice ttsfm.Voice,
+	format ttsfm.AudioFormat,
+	autoCombine bool,
+) {
+	opts := []ttsfm.RequestOption{
+		ttsfm.WithVoice(voice),
+		ttsfm.WithFormat(format),
+		ttsfm.WithMaxLength(req.MaxLength),
+	}
+	if strings.TrimSpace(req.Instructions) != "" {
+		opts = append(opts, ttsfm.WithInstructions(req.Instructions))
+	}
+	if req.Speed != 0 {
+		opts = append(opts, ttsfm.WithSpeed(req.Speed))
+	}
+
+	// 获取流式响应
+	streamResp, err := h.client.GenerateSpeechStream(ctx, req.Input, opts...)
+	if err != nil {
+		h.handleError(c, err)
+		return
+	}
+	defer streamResp.Close()
+
+	// 设置响应头
+	c.Header("Content-Type", streamResp.ContentType)
+	c.Header("Transfer-Encoding", "chunked")
+	c.Header("X-Audio-Format", string(streamResp.Format))
+	c.Header("X-Chunks-Combined", "1")
+	c.Header("X-Auto-Combine", fmt.Sprintf("%v", autoCombine))
+	c.Header("X-Powered-By", "TTSFM-OpenAI-Compatible")
+
+	// 设置状态码
+	c.Status(http.StatusOK)
+
+	// 流式写入响应
+	written, err := io.Copy(c.Writer, streamResp.Body)
+	if err != nil && !errors.Is(err, io.EOF) && err.Error() != "EOF" {
+		// 此时已经开始写入响应，无法返回 JSON 错误
+		h.error("Error streaming response: %v (written %d bytes)", err, written)
+		return
+	}
+
+	h.info("Successfully streamed %d bytes of %s audio", written, streamResp.Format)
 }
 
 func (h *Handler) handleLongText(
@@ -204,7 +258,6 @@ func (h *Handler) handleLongText(
 		chunks = append(chunks, r.AudioData)
 	}
 
-	// 以服务实际返回的格式为准（避免“请求 mp3 但服务返回 wav”造成标头不一致）
 	actualFormat := responses[0].Format
 	contentType := responses[0].ContentType
 
@@ -233,43 +286,6 @@ func (h *Handler) handleLongText(
 	c.Header("X-Powered-By", "TTSFM-OpenAI-Compatible")
 
 	c.Data(http.StatusOK, contentType, combinedAudio)
-}
-
-func (h *Handler) handleShortText(
-	c *gin.Context,
-	ctx context.Context,
-	req *SpeechRequest,
-	voice ttsfm.Voice,
-	format ttsfm.AudioFormat,
-	autoCombine bool,
-) {
-	opts := []ttsfm.RequestOption{
-		ttsfm.WithVoice(voice),
-		ttsfm.WithFormat(format),
-		ttsfm.WithMaxLength(req.MaxLength),
-	}
-	if strings.TrimSpace(req.Instructions) != "" {
-		opts = append(opts, ttsfm.WithInstructions(req.Instructions))
-	}
-	if req.Speed != 0 {
-		opts = append(opts, ttsfm.WithSpeed(req.Speed))
-	}
-
-	response, err := h.client.GenerateSpeech(ctx, req.Input, opts...)
-	if err != nil {
-		h.handleError(c, err)
-		return
-	}
-
-	c.Header("Content-Type", response.ContentType)
-	c.Header("Content-Length", strconv.Itoa(response.Size))
-	c.Header("X-Audio-Format", string(response.Format))
-	c.Header("X-Audio-Size", strconv.Itoa(response.Size))
-	c.Header("X-Chunks-Combined", "1")
-	c.Header("X-Auto-Combine", fmt.Sprintf("%v", autoCombine))
-	c.Header("X-Powered-By", "TTSFM-OpenAI-Compatible")
-
-	c.Data(http.StatusOK, response.ContentType, response.AudioData)
 }
 
 func (h *Handler) handleError(c *gin.Context, err error) {

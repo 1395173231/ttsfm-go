@@ -2,8 +2,6 @@ package ttsfm
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -60,6 +57,30 @@ func DefaultClientConfig() *ClientConfig {
 		MaxConcurrent: 10,
 		Logger:        &DefaultLogger{},
 	}
+}
+
+// TTSStreamResponse 流式响应
+type TTSStreamResponse struct {
+	Body        io.ReadCloser     // 原始响应体流
+	ContentType string            // 内容类型
+	Format      AudioFormat       // 音频格式
+	Metadata    map[string]string // 元数据
+}
+
+// Close 关闭流式响应
+func (r *TTSStreamResponse) Close() error {
+	if r.Body != nil {
+		return r.Body.Close()
+	}
+	return nil
+}
+
+// WriteTo 将流写入 writer（实现 io.WriterTo 接口）
+func (r *TTSStreamResponse) WriteTo(w io.Writer) (int64, error) {
+	if r.Body == nil {
+		return 0, nil
+	}
+	return io.Copy(w, r.Body)
 }
 
 // TTSClient TTS 客户端
@@ -196,8 +217,31 @@ func (c *TTSClient) ClearProxy() error {
 	return c.httpClient.SetProxy("")
 }
 
-// GenerateSpeech 生成语音
+// GenerateSpeech 生成语音（保留原有方法以保持兼容性）
 func (c *TTSClient) GenerateSpeech(ctx context.Context, text string, opts ...RequestOption) (*TTSResponse, error) {
+	streamResp, err := c.GenerateSpeechStream(ctx, text, opts...)
+	if err != nil {
+		return nil, err
+	}
+	defer streamResp.Close()
+
+	// 读取全部数据
+	audioData, err := io.ReadAll(streamResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read audio data: %w", err)
+	}
+
+	return &TTSResponse{
+		AudioData:   audioData,
+		ContentType: streamResp.ContentType,
+		Format:      streamResp.Format,
+		Size:        len(audioData),
+		Metadata:    streamResp.Metadata,
+	}, nil
+}
+
+// GenerateSpeechStream 生成语音并返回流式响应
+func (c *TTSClient) GenerateSpeechStream(ctx context.Context, text string, opts ...RequestOption) (*TTSStreamResponse, error) {
 	sanitizedText, err := SanitizeText(text)
 	if err != nil {
 		return nil, err
@@ -208,7 +252,7 @@ func (c *TTSClient) GenerateSpeech(ctx context.Context, text string, opts ...Req
 		return nil, err
 	}
 
-	return c.makeRequest(ctx, request)
+	return c.makeStreamRequest(ctx, request)
 }
 
 // GenerateSpeechLongText 处理长文本生成语音
@@ -256,7 +300,7 @@ func (c *TTSClient) GenerateSpeechBatch(ctx context.Context, requests []*TTSRequ
 	for i, req := range requests {
 		go func(idx int, request *TTSRequest) {
 			defer wg.Done()
-			resp, err := c.makeRequest(ctx, request)
+			resp, err := c.GenerateSpeechFromRequest(ctx, request)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -278,11 +322,33 @@ func (c *TTSClient) GenerateSpeechBatch(ctx context.Context, requests []*TTSRequ
 
 // GenerateSpeechFromRequest 从请求对象生成语音
 func (c *TTSClient) GenerateSpeechFromRequest(ctx context.Context, request *TTSRequest) (*TTSResponse, error) {
-	return c.makeRequest(ctx, request)
+	streamResp, err := c.makeStreamRequest(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	defer streamResp.Close()
+
+	audioData, err := io.ReadAll(streamResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read audio data: %w", err)
+	}
+
+	return &TTSResponse{
+		AudioData:   audioData,
+		ContentType: streamResp.ContentType,
+		Format:      streamResp.Format,
+		Size:        len(audioData),
+		Metadata:    streamResp.Metadata,
+	}, nil
 }
 
-// makeRequest 执行实际的 HTTP 请求（tls-client）
-func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSResponse, error) {
+// GenerateSpeechFromRequestStream 从请求对象生成语音流
+func (c *TTSClient) GenerateSpeechFromRequestStream(ctx context.Context, request *TTSRequest) (*TTSStreamResponse, error) {
+	return c.makeStreamRequest(ctx, request)
+}
+
+// makeStreamRequest 执行实际的 HTTP 请求并返回流式响应
+func (c *TTSClient) makeStreamRequest(ctx context.Context, request *TTSRequest) (*TTSStreamResponse, error) {
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
@@ -299,6 +365,7 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 		"input":           request.Input,
 		"voice":           string(request.Voice),
 		"generation":      uuid.New().String(),
+		"vibe":            "dramatic",
 		"response_format": string(request.ResponseFormat),
 	}
 
@@ -353,14 +420,13 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 		}
 
 		req.Header.Set("Content-Type", contentType)
-		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 		req.Header.Set("Accept", "application/json, audio/*")
 
 		if c.config.APIKey != "" {
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.config.APIKey))
 		}
 
-		// 尽量固定 header 顺序（更接近浏览器）
 		req.Header[http.HeaderOrderKey] = []string{
 			"accept",
 			"accept-encoding",
@@ -379,16 +445,13 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 			continue
 		}
 
-		respBody, err := io.ReadAll(http.DecompressBody(resp))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = NewNetworkException(fmt.Sprintf("Failed to read response: %v", err), attempt)
-			continue
+		if resp.StatusCode == http.StatusOK {
+			return c.processStreamResponse(resp, request)
 		}
 
-		if resp.StatusCode == http.StatusOK {
-			return c.processResponse(resp, respBody, request)
-		}
+		// 非成功状态码，需要读取响应体获取错误信息
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
 		var errorData map[string]interface{}
 		_ = json.Unmarshal(respBody, &errorData)
@@ -414,52 +477,13 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 	return nil, NewTTSException("Maximum retries exceeded")
 }
 
-func readAndDecompress(resp *http.Response) ([]byte, error) {
-	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
-
-	var reader io.Reader = resp.Body
-	var closeFn func() error
-
-	switch encoding {
-	case "gzip":
-		gr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("gzip reader error: %w", err)
-		}
-		closeFn = gr.Close
-		reader = gr
-	case "deflate":
-		dr := flate.NewReader(resp.Body)
-		closeFn = dr.Close
-		reader = dr
-	case "br":
-		reader = brotli.NewReader(resp.Body)
-	case "", "identity":
-	default:
-	}
-
-	data, err := io.ReadAll(reader)
-	if closeFn != nil {
-		_ = closeFn()
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read error: %w", err)
-	}
-	return data, nil
-}
-
-// processResponse 处理成功的响应
-func (c *TTSClient) processResponse(
+// processStreamResponse 处理成功的流式响应
+func (c *TTSClient) processStreamResponse(
 	resp *http.Response,
-	body []byte,
 	request *TTSRequest,
-) (*TTSResponse, error) {
+) (*TTSStreamResponse, error) {
 	contentType := resp.Header.Get("Content-Type")
 	contentTypeLower := strings.ToLower(contentType)
-
-	if len(body) == 0 {
-		return nil, NewAPIException("Received empty audio data from openai.fm", resp.StatusCode)
-	}
 
 	var actualFormat AudioFormat
 	switch {
@@ -477,8 +501,6 @@ func (c *TTSClient) processResponse(
 		actualFormat = FormatMP3
 	}
 
-	estimatedDuration := EstimateAudioDuration(request.Input, 150)
-
 	requestedFormat := request.ResponseFormat
 	if actualFormat != requestedFormat {
 		if MapsToWAV(string(requestedFormat)) && actualFormat == FormatWAV {
@@ -488,13 +510,13 @@ func (c *TTSClient) processResponse(
 				requestedFormat, actualFormat)
 		}
 	}
-
-	ttsResponse := &TTSResponse{
-		AudioData:   body,
+	if !resp.Uncompressed {
+		resp.Body = http.DecompressBody(resp)
+	}
+	streamResp := &TTSStreamResponse{
+		Body:        resp.Body,
 		ContentType: contentType,
 		Format:      actualFormat,
-		Size:        len(body),
-		Duration:    estimatedDuration,
 		Metadata: map[string]string{
 			"status_code":      fmt.Sprintf("%d", resp.StatusCode),
 			"service":          "openai.fm",
@@ -504,10 +526,10 @@ func (c *TTSClient) processResponse(
 		},
 	}
 
-	c.logger.Info("Successfully generated %s of %s audio from openai.fm using voice '%s'",
-		FormatFileSize(len(body)), string(actualFormat), request.Voice)
+	c.logger.Info("Streaming %s audio from openai.fm using voice '%s'",
+		string(actualFormat), request.Voice)
 
-	return ttsResponse, nil
+	return streamResp, nil
 }
 
 // Close 关闭客户端

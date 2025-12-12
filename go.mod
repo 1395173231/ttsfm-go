@@ -5,15 +5,16 @@ go 1.24.1
 toolchain go1.24.6
 
 require (
+	github.com/andybalholm/brotli v1.1.1
+	github.com/bogdanfinn/fhttp v0.6.3
+	github.com/bogdanfinn/tls-client v1.11.2
 	github.com/gin-gonic/gin v1.11.0
 	github.com/google/uuid v1.6.0
+	github.com/joho/godotenv v1.5.1
 )
 
 require (
-	github.com/andybalholm/brotli v1.1.1 // indirect
-	github.com/bogdanfinn/fhttp v0.6.3 // indirect
 	github.com/bogdanfinn/quic-go-utls v1.0.4-utls // indirect
-	github.com/bogdanfinn/tls-client v1.11.2 // indirect
 	github.com/bogdanfinn/utls v1.7.4-barnius // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect

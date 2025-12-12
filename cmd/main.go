@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/joho/godotenv/autoload"
 	"ttsfm-go/server"
 	"ttsfm-go/ttsfm"
 )
@@ -61,7 +62,7 @@ func main() {
 	}
 	//TTSFM_TIMEOUT
 	if envTimeout := strings.TrimSpace(os.Getenv("TTSFM_TIMEOUT")); envTimeout != "" {
-		if eTimeout, err := time.ParseDuration(envTimeout); err != nil {
+		if eTimeout, err := time.ParseDuration(envTimeout); err == nil {
 			*timeout = eTimeout
 		}
 	}
