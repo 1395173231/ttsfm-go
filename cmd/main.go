@@ -21,6 +21,7 @@ func main() {
 	rateLimit := flag.Int("rate-limit", 10, "Requests per second limit")
 	timeout := flag.Duration("timeout", 60*time.Second, "Request timeout")
 	baseURL := flag.String("base-url", "https://www.openai.fm", "TTS service base URL")
+	autoCombine := flag.Bool("auto-combine", true, "Automatically combine API keys")
 
 	flag.Parse()
 
@@ -50,6 +51,9 @@ func main() {
 	if envBaseURL := strings.TrimSpace(os.Getenv("TTSFM_BASE_URL")); envBaseURL != "" {
 		*baseURL = envBaseURL
 	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TTSFM_AUTO_COMBINE")), "true") {
+		*autoCombine = true
+	}
 
 	var keys []string
 	if strings.TrimSpace(*apiKeys) != "" {
@@ -77,8 +81,8 @@ func main() {
 		EnableCORS:      true,
 		EnableRateLimit: *enableRateLimit,
 		RateLimitPerSec: *rateLimit,
-
-		Logger: logger,
+		AutoCombine:     *autoCombine,
+		Logger:          logger,
 		TTSClientOptions: []ttsfm.ClientOption{
 			ttsfm.WithBaseURL(*baseURL),
 			ttsfm.WithTimeout(*timeout),

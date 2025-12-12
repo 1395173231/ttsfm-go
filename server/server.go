@@ -23,10 +23,10 @@ type ServerConfig struct {
 	RequestTimeout  time.Duration
 	ShutdownTimeout time.Duration
 
-	EnableCORS      bool
-	EnableRateLimit bool
-	RateLimitPerSec int
-
+	EnableCORS       bool
+	EnableRateLimit  bool
+	RateLimitPerSec  int
+	AutoCombine      bool
 	Logger           ttsfm.Logger
 	TTSClientOptions []ttsfm.ClientOption
 }
@@ -80,11 +80,11 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	engine := gin.New()
 
 	srv := &Server{
-		config:   config,
-		engine:   engine,
+		config:    config,
+		engine:    engine,
 		ttsClient: ttsClient,
-		handler:  NewHandler(ttsClient, config.Logger, config.RequestTimeout),
-		logger:   config.Logger,
+		handler:   NewHandler(ttsClient, config.Logger, config.RequestTimeout),
+		logger:    config.Logger,
 	}
 
 	srv.setupMiddleware()

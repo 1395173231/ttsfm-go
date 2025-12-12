@@ -55,8 +55,10 @@ services:
         max-file: "5"
     networks:
       - ttsfm-network
-
+      - dokploy-network
 networks:
   ttsfm-network:
     driver: overlay
     attachable: true
+  dokploy-network:
+    external: true

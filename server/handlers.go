@@ -44,20 +44,22 @@ type SpeechClient interface {
 
 // Handler 处理器
 type Handler struct {
-	client  SpeechClient
-	logger  ttsfm.Logger
-	timeout time.Duration
+	client      SpeechClient
+	logger      ttsfm.Logger
+	timeout     time.Duration
+	AutoCombine bool
 }
 
 // NewHandler 创建处理器
-func NewHandler(client SpeechClient, logger ttsfm.Logger, timeout time.Duration) *Handler {
+func NewHandler(client SpeechClient, logger ttsfm.Logger, timeout time.Duration, AutoCombine bool) *Handler {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	return &Handler{
-		client:  client,
-		logger:  logger,
-		timeout: timeout,
+		client:      client,
+		logger:      logger,
+		timeout:     timeout,
+		AutoCombine: AutoCombine,
 	}
 }
 
@@ -86,6 +88,7 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 	if req.MaxLength == 0 {
 		req.MaxLength = 4096
 	}
+	req.AutoCombine = h.AutoCombine
 
 	// auto_combine 默认：当文本不超长时可认为“无需分片”，这里不强制开启。
 	// 只有当超长且 auto_combine=true 才会自动分割+合并。
