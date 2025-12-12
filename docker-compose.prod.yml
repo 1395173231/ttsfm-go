@@ -5,20 +5,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: ahhhliu/ttsfm-go:latest
     container_name: ttsfm-prod
     restart: always
     ports:
-      - "8080:8080"
+      - "${TTSFM_PORT:-8080}:8080"
     environment:
-      - TTSFM_HOST=0.0.0.0
-      - TTSFM_PORT=8080
-      - TTSFM_ENABLE_AUTH=true
-      - TTSFM_API_KEYS=${TTSFM_API_KEYS}
-      - TTSFM_ENABLE_RATE_LIMIT=true
-      - TTSFM_RATE_LIMIT=20
-      - TTSFM_TIMEOUT=120s
-      - TTSFM_BASE_URL=https://www.openai.fm
-      - TZ=Asia/Shanghai
+      - TTSFM_HOST=${TTSFM_HOST:-0.0.0.0}
+      - TTSFM_PORT=${TTSFM_PORT:-8080}
+      - TTSFM_ENABLE_AUTH=${TTSFM_ENABLE_AUTH:-false}
+      - TTSFM_API_KEYS=${TTSFM_API_KEYS:-}
+      - TTSFM_ENABLE_RATE_LIMIT=${TTSFM_ENABLE_RATE_LIMIT:-false}
+      - TTSFM_RATE_LIMIT=${TTSFM_RATE_LIMIT:-20}
+      - TTSFM_TIMEOUT=${TTSFM_TIMEOUT:-120s}
+      - TTSFM_BASE_URL=${TTSFM_BASE_URL:-https://www.openai.fm}
+      - TZ=${TZ:-Asia/Shanghai}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
@@ -27,7 +28,7 @@ services:
       start_period: 10s
     deploy:
       mode: replicated
-      replicas: 2
+      replicas: ${TTSFM_REPLICAS:-1}
       resources:
         limits:
           cpus: '4'
@@ -55,24 +56,6 @@ services:
         max-file: "5"
     networks:
       - ttsfm-network
-
-  # Nginx 反向代理（可选）
-  nginx:
-    image: nginx:alpine
-    container_name: ttsfm-nginx
-    restart: always
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/etc/nginx/certs:ro
-    depends_on:
-      - ttsfm
-    networks:
-      - ttsfm-network
-    profiles:
-      - with-nginx
 
 networks:
   ttsfm-network:
