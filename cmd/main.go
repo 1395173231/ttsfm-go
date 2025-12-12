@@ -49,6 +49,7 @@ func main() {
 			*rateLimit = r
 		}
 	}
+
 	if envBaseURL := strings.TrimSpace(os.Getenv("TTSFM_BASE_URL")); envBaseURL != "" {
 		*baseURL = envBaseURL
 	}
@@ -58,7 +59,12 @@ func main() {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("TTSFM_AUTO_COMBINE")), "true") {
 		*autoCombine = true
 	}
-
+	//TTSFM_TIMEOUT
+	if envTimeout := strings.TrimSpace(os.Getenv("TTSFM_TIMEOUT")); envTimeout != "" {
+		if eTimeout, err := time.ParseDuration(envTimeout); err != nil {
+			*timeout = eTimeout
+		}
+	}
 	var keys []string
 	if strings.TrimSpace(*apiKeys) != "" {
 		parts := strings.Split(*apiKeys, ",")
