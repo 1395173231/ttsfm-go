@@ -2,17 +2,23 @@ package ttsfm
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	http "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/google/uuid"
 )
 
@@ -40,6 +46,7 @@ type ClientConfig struct {
 	MaxRetries    int
 	VerifySSL     bool
 	MaxConcurrent int
+	ProxyURL      string
 	Logger        Logger
 }
 
@@ -58,7 +65,7 @@ func DefaultClientConfig() *ClientConfig {
 // TTSClient TTS 客户端
 type TTSClient struct {
 	config     *ClientConfig
-	httpClient *http.Client
+	httpClient tls_client.HttpClient
 	semaphore  chan struct{}
 	logger     Logger
 }
@@ -85,9 +92,34 @@ func NewTTSClient(opts ...ClientOption) (*TTSClient, error) {
 	if config.Logger == nil {
 		config.Logger = &DefaultLogger{}
 	}
+	if config.Timeout <= 0 {
+		config.Timeout = 30 * time.Second
+	}
 
-	httpClient := &http.Client{
-		Timeout: config.Timeout,
+	timeoutSeconds := int(math.Ceil(config.Timeout.Seconds()))
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1
+	}
+
+	jar := tls_client.NewCookieJar()
+	tlsOptions := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(timeoutSeconds),
+		tls_client.WithClientProfile(profiles.Safari_IOS_18_5),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithCookieJar(jar),
+	}
+
+	if !config.VerifySSL {
+		tlsOptions = append(tlsOptions, tls_client.WithInsecureSkipVerify())
+	}
+
+	if strings.TrimSpace(config.ProxyURL) != "" {
+		tlsOptions = append(tlsOptions, tls_client.WithProxyUrl(strings.TrimSpace(config.ProxyURL)))
+	}
+
+	httpClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), tlsOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tls client: %w", err)
 	}
 
 	client := &TTSClient{
@@ -140,11 +172,28 @@ func WithMaxConcurrent(concurrent int) ClientOption {
 	}
 }
 
+// WithProxyURL 设置代理地址（支持 http/https/socks5）
+func WithProxyURL(proxyURL string) ClientOption {
+	return func(c *ClientConfig) {
+		c.ProxyURL = proxyURL
+	}
+}
+
 // WithLogger 设置日志器
 func WithLogger(logger Logger) ClientOption {
 	return func(c *ClientConfig) {
 		c.Logger = logger
 	}
+}
+
+// SetProxy 动态设置代理
+func (c *TTSClient) SetProxy(proxyURL string) error {
+	return c.httpClient.SetProxy(strings.TrimSpace(proxyURL))
+}
+
+// ClearProxy 清除代理
+func (c *TTSClient) ClearProxy() error {
+	return c.httpClient.SetProxy("")
 }
 
 // GenerateSpeech 生成语音
@@ -232,7 +281,7 @@ func (c *TTSClient) GenerateSpeechFromRequest(ctx context.Context, request *TTSR
 	return c.makeRequest(ctx, request)
 }
 
-// makeRequest 执行实际的 HTTP 请求
+// makeRequest 执行实际的 HTTP 请求（tls-client）
 func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSResponse, error) {
 	select {
 	case c.semaphore <- struct{}{}:
@@ -274,6 +323,8 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 	c.logger.Info("Generating speech for text: '%s...' with voice: %s",
 		truncateString(request.Input, 50), request.Voice)
 
+	bodyBytes := body.Bytes()
+
 	var lastErr error
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -287,20 +338,38 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body.Bytes()))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
 			lastErr = fmt.Errorf("failed to create request: %w", err)
 			continue
+		}
+		if ctx != nil {
+			req = req.WithContext(ctx)
 		}
 
 		headers := GetRealisticHeaders()
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
+
 		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Accept", "application/json, audio/*")
 
 		if c.config.APIKey != "" {
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.config.APIKey))
+		}
+
+		// 尽量固定 header 顺序（更接近浏览器）
+		req.Header[http.HeaderOrderKey] = []string{
+			"accept",
+			"accept-encoding",
+			"accept-language",
+			"cache-control",
+			"content-type",
+			"dnt",
+			"pragma",
+			"user-agent",
 		}
 
 		resp, err := c.httpClient.Do(req)
@@ -310,7 +379,7 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 			continue
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(http.DecompressBody(resp))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = NewNetworkException(fmt.Sprintf("Failed to read response: %v", err), attempt)
@@ -343,6 +412,40 @@ func (c *TTSClient) makeRequest(ctx context.Context, request *TTSRequest) (*TTSR
 		return nil, lastErr
 	}
 	return nil, NewTTSException("Maximum retries exceeded")
+}
+
+func readAndDecompress(resp *http.Response) ([]byte, error) {
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+
+	var reader io.Reader = resp.Body
+	var closeFn func() error
+
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip reader error: %w", err)
+		}
+		closeFn = gr.Close
+		reader = gr
+	case "deflate":
+		dr := flate.NewReader(resp.Body)
+		closeFn = dr.Close
+		reader = dr
+	case "br":
+		reader = brotli.NewReader(resp.Body)
+	case "", "identity":
+	default:
+	}
+
+	data, err := io.ReadAll(reader)
+	if closeFn != nil {
+		_ = closeFn()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read error: %w", err)
+	}
+	return data, nil
 }
 
 // processResponse 处理成功的响应

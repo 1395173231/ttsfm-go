@@ -21,6 +21,7 @@ func main() {
 	rateLimit := flag.Int("rate-limit", 10, "Requests per second limit")
 	timeout := flag.Duration("timeout", 60*time.Second, "Request timeout")
 	baseURL := flag.String("base-url", "https://www.openai.fm", "TTS service base URL")
+	proxyURL := flag.String("proxy", "", "Proxy URL (http, https, socks5)")
 	autoCombine := flag.Bool("auto-combine", true, "Automatically combine API keys")
 
 	flag.Parse()
@@ -50,6 +51,9 @@ func main() {
 	}
 	if envBaseURL := strings.TrimSpace(os.Getenv("TTSFM_BASE_URL")); envBaseURL != "" {
 		*baseURL = envBaseURL
+	}
+	if envProxy := strings.TrimSpace(os.Getenv("TTSFM_PROXY_URL")); envProxy != "" && strings.TrimSpace(*proxyURL) == "" {
+		*proxyURL = envProxy
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("TTSFM_AUTO_COMBINE")), "true") {
 		*autoCombine = true
@@ -87,6 +91,7 @@ func main() {
 			ttsfm.WithBaseURL(*baseURL),
 			ttsfm.WithTimeout(*timeout),
 			ttsfm.WithMaxRetries(3),
+			ttsfm.WithProxyURL(*proxyURL),
 			ttsfm.WithLogger(logger),
 		},
 	}

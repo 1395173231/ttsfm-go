@@ -379,3 +379,13 @@ Pronunciation: Clear, articulate, and steady, ensuring each word is easily under
 Pause: Brief, purposeful pauses between sentences to allow time for the listener to process the information.
 
 Emotion: Warm and engaging, conveying the intended message effectively.`
+
+//Affect/personality: A cheerful guide
+//
+//Tone: Friendly, clear, and reassuring, creating a calm atmosphere and making the listener feel confident and comfortable.
+//
+//Pronunciation: Clear, articulate, and steady, ensuring each instruction is easily understood while maintaining a natural, conversational flow.
+//
+//Pause: Brief, purposeful pauses after key instructions (e.g., "cross the street" and "turn right") to allow time for the listener to process the information and follow along.
+//
+//Emotion: Warm and supportive, conveying empathy and care, ensuring the listener feels guided and safe throughout the journey.

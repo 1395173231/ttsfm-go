@@ -1,6 +1,8 @@
 module ttsfm-go
 
-go 1.23.0
+go 1.24.1
+
+toolchain go1.24.6
 
 require (
 	github.com/gin-gonic/gin v1.11.0
@@ -8,8 +10,14 @@ require (
 )
 
 require (
+	github.com/andybalholm/brotli v1.1.1 // indirect
+	github.com/bogdanfinn/fhttp v0.6.3 // indirect
+	github.com/bogdanfinn/quic-go-utls v1.0.4-utls // indirect
+	github.com/bogdanfinn/tls-client v1.11.2 // indirect
+	github.com/bogdanfinn/utls v1.7.4-barnius // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
+	github.com/cloudflare/circl v1.5.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.8 // indirect
 	github.com/gin-contrib/sse v1.1.0 // indirect
@@ -19,6 +27,7 @@ require (
 	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/goccy/go-yaml v1.18.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -27,6 +36,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/quic-go/quic-go v0.54.0 // indirect
+	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
