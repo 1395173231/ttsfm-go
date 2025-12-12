@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 构建产物
+bin/
+tmp/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试
+*_test.go
+testdata/
+coverage.out
+coverage.html
+
+# 文档
+*.md
+docs/
+LICENSE
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker
+
+# 其他
+.env
+.env.*
+*.log
+.air.toml
+.DS_Store
