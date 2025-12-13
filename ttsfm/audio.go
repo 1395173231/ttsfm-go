@@ -1,11 +1,218 @@
 package ttsfm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
+
+var wavRiffHeader = [12]byte{'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E'}
+
+func copyNBuffer(dst io.Writer, src io.Reader, n int64, buf []byte) (int64, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("buffer size must be > 0")
+	}
+
+	var written int64
+	for written < n {
+		toRead := int64(len(buf))
+		remain := n - written
+		if remain < toRead {
+			toRead = remain
+		}
+
+		readN, readErr := src.Read(buf[:toRead])
+		if readN > 0 {
+			writeN, writeErr := dst.Write(buf[:readN])
+			written += int64(writeN)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeN != readN {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, io.EOF
+			}
+			return written, readErr
+		}
+	}
+
+	return written, nil
+}
+
+// CopyMP3Stream 将 MP3 数据从 r 写到 w；当 skipID3=true 时会尝试跳过 ID3v2 标签。
+// 用于长文本拼接时避免重复写入 ID3 标签。
+// 返回写入的字节数（不包含被丢弃的 ID3）。
+func CopyMP3Stream(w io.Writer, r io.Reader, skipID3 bool) (int64, error) {
+	br := bufio.NewReader(r)
+
+	if skipID3 {
+		if err := discardID3v2(br); err != nil {
+			return 0, err
+		}
+	}
+
+	return io.Copy(w, br)
+}
+
+// CopyMP3StreamWithBuffer 与 CopyMP3Stream 类似，但允许显式指定拷贝缓冲区大小（buf）。
+func CopyMP3StreamWithBuffer(w io.Writer, r io.Reader, skipID3 bool, buf []byte) (int64, error) {
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("buffer size must be > 0")
+	}
+
+	br := bufio.NewReaderSize(r, len(buf))
+	if skipID3 {
+		if err := discardID3v2(br); err != nil {
+			return 0, err
+		}
+	}
+	return io.CopyBuffer(w, br, buf)
+}
+
+func discardID3v2(br *bufio.Reader) error {
+	header, err := br.Peek(10)
+	if err != nil {
+		// 数据不足 10 字节时，不做处理
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	if len(header) < 10 {
+		return nil
+	}
+	if header[0] != 'I' || header[1] != 'D' || header[2] != '3' {
+		return nil
+	}
+
+	// ID3v2 size 使用 syncsafe integer（不包含 10 字节 header）
+	size := int(header[6])<<21 | int(header[7])<<14 | int(header[8])<<7 | int(header[9])
+	total := size + 10
+	_, err = br.Discard(total)
+	return err
+}
+
+// CopyWAVDataStream 解析 WAV 容器并只将 data chunk（PCM 数据）写入 w。
+// 适用于流式拼接：第一个 chunk 写完整 WAV（含头），后续 chunk 只写 data，避免重复头。
+// 返回写入的 PCM 数据字节数。
+func CopyWAVDataStream(w io.Writer, r io.Reader) (int64, error) {
+	br := bufio.NewReader(r)
+
+	var header [12]byte
+	if _, err := io.ReadFull(br, header[:]); err != nil {
+		return 0, err
+	}
+	if header[0] != wavRiffHeader[0] || header[1] != wavRiffHeader[1] || header[2] != wavRiffHeader[2] ||
+		header[3] != wavRiffHeader[3] || header[8] != wavRiffHeader[8] || header[9] != wavRiffHeader[9] ||
+		header[10] != wavRiffHeader[10] || header[11] != wavRiffHeader[11] {
+		// 不是 WAV，按裸数据写回（把已经读出的 12 字节也写回）
+		n1, err := w.Write(header[:])
+		if err != nil {
+			return int64(n1), err
+		}
+		n2, err := io.Copy(w, br)
+		return int64(n1) + n2, err
+	}
+
+	var written int64
+	for {
+		var chunkHeader [8]byte
+		if _, err := io.ReadFull(br, chunkHeader[:]); err != nil {
+			return written, err
+		}
+		chunkID := string(chunkHeader[0:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+
+		if chunkID == "data" {
+			n, err := io.CopyN(w, br, int64(chunkSize))
+			written += n
+			if err != nil && !errors.Is(err, io.EOF) {
+				return written, err
+			}
+			// padding byte（WAV chunk 对齐到 2 字节）
+			if chunkSize%2 != 0 {
+				_, _ = br.ReadByte()
+			}
+			return written, nil
+		}
+
+		// 丢弃其他 chunk
+		if _, err := io.CopyN(io.Discard, br, int64(chunkSize)); err != nil {
+			if errors.Is(err, io.EOF) {
+				return written, nil
+			}
+			return written, err
+		}
+		if chunkSize%2 != 0 {
+			_, _ = br.ReadByte()
+		}
+	}
+}
+
+// CopyWAVDataStreamWithBuffer 与 CopyWAVDataStream 类似，但允许显式指定拷贝缓冲区大小（buf）。
+func CopyWAVDataStreamWithBuffer(w io.Writer, r io.Reader, buf []byte) (int64, error) {
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("buffer size must be > 0")
+	}
+
+	br := bufio.NewReaderSize(r, len(buf))
+
+	var header [12]byte
+	if _, err := io.ReadFull(br, header[:]); err != nil {
+		return 0, err
+	}
+	if header[0] != wavRiffHeader[0] || header[1] != wavRiffHeader[1] || header[2] != wavRiffHeader[2] ||
+		header[3] != wavRiffHeader[3] || header[8] != wavRiffHeader[8] || header[9] != wavRiffHeader[9] ||
+		header[10] != wavRiffHeader[10] || header[11] != wavRiffHeader[11] {
+		// 不是 WAV，按裸数据写回（把已经读出的 12 字节也写回）
+		n1, err := w.Write(header[:])
+		if err != nil {
+			return int64(n1), err
+		}
+		n2, err := io.CopyBuffer(w, br, buf)
+		return int64(n1) + n2, err
+	}
+
+	var written int64
+	for {
+		var chunkHeader [8]byte
+		if _, err := io.ReadFull(br, chunkHeader[:]); err != nil {
+			return written, err
+		}
+		chunkID := string(chunkHeader[0:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+
+		if chunkID == "data" {
+			n, err := copyNBuffer(w, br, int64(chunkSize), buf)
+			written += n
+			if err != nil && !errors.Is(err, io.EOF) {
+				return written, err
+			}
+			if chunkSize%2 != 0 {
+				_, _ = br.ReadByte()
+			}
+			return written, nil
+		}
+
+		_, err := copyNBuffer(io.Discard, br, int64(chunkSize), buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return written, err
+		}
+		if chunkSize%2 != 0 {
+			_, _ = br.ReadByte()
+		}
+	}
+}
 
 // CombineAudioChunks 合并多个音频块
 func CombineAudioChunks(chunks [][]byte, format AudioFormat) ([]byte, error) {

@@ -51,9 +51,9 @@ type Server struct {
 	engine *gin.Engine
 
 	httpServer *http.Server
-	ttsClient  *ttsfm.TTSClient
-	handler    *Handler
-	logger     ttsfm.Logger
+	//ttsClient  *ttsfm.TTSClient
+	handler *Handler
+	logger  ttsfm.Logger
 }
 
 // NewServer 创建服务器
@@ -71,20 +71,14 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		config.ShutdownTimeout = 10 * time.Second
 	}
 
-	ttsClient, err := ttsfm.NewTTSClient(config.TTSClientOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create TTS client: %w", err)
-	}
-
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 
 	srv := &Server{
-		config:    config,
-		engine:    engine,
-		ttsClient: ttsClient,
-		handler:   NewHandler(ttsClient, config.Logger, config.RequestTimeout, config.AutoCombine),
-		logger:    config.Logger,
+		config:  config,
+		engine:  engine,
+		handler: NewHandler(config),
+		logger:  config.Logger,
 	}
 
 	srv.setupMiddleware()
@@ -174,11 +168,11 @@ func (s *Server) StartWithGracefulShutdown() error {
 		return err
 	}
 
-	if s.ttsClient != nil {
-		if err := s.ttsClient.Close(); err != nil {
-			s.logger.Error("Failed to close TTS client: %v", err)
-		}
-	}
+	//if s.ttsClient != nil {
+	//	if err := s.ttsClient.Close(); err != nil {
+	//		s.logger.Error("Failed to close TTS client: %v", err)
+	//	}
+	//}
 
 	s.logger.Info("Server stopped")
 	return nil
@@ -191,9 +185,9 @@ func (s *Server) Stop(ctx context.Context) error {
 			return err
 		}
 	}
-	if s.ttsClient != nil {
-		return s.ttsClient.Close()
-	}
+	//if s.ttsClient != nil {
+	//	return s.ttsClient.Close()
+	//}
 	return nil
 }
 

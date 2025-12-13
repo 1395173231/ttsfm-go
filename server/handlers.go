@@ -48,22 +48,23 @@ type SpeechClient interface {
 
 // Handler 处理器
 type Handler struct {
-	client             SpeechClient
+	TTSClientOptions   []ttsfm.ClientOption
 	logger             ttsfm.Logger
 	timeout            time.Duration
 	autoCombineDefault bool
 }
 
 // NewHandler 创建处理器
-func NewHandler(client SpeechClient, logger ttsfm.Logger, timeout time.Duration, autoCombineDefault bool) *Handler {
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+func NewHandler(cfg *ServerConfig) *Handler {
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 60 * time.Second
 	}
+
 	return &Handler{
-		client:             client,
-		logger:             logger,
-		timeout:            timeout,
-		autoCombineDefault: autoCombineDefault,
+		logger:             cfg.Logger,
+		timeout:            cfg.RequestTimeout,
+		autoCombineDefault: cfg.AutoCombine,
+		TTSClientOptions:   cfg.TTSClientOptions,
 	}
 }
 
@@ -90,7 +91,7 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 		req.ResponseFormat = "mp3"
 	}
 	if req.MaxLength == 0 {
-		req.MaxLength = 4096
+		req.MaxLength = 2048
 	}
 
 	autoCombine := h.autoCombineDefault
@@ -141,8 +142,8 @@ func (h *Handler) OpenAISpeech(c *gin.Context) {
 	textLength := len(req.Input)
 
 	if textLength > req.MaxLength && autoCombine {
-		// 长文本需要分片处理，无法完全流式
-		h.handleLongText(c, ctx, &req, voice, format)
+		// 长文本：分片后按格式流式拼接输出，避免内存峰值并降低等待时间
+		h.handleLongTextStream(c, ctx, &req, voice, format)
 		return
 	}
 
@@ -185,9 +186,14 @@ func (h *Handler) handleShortTextStream(
 	if req.Speed != 0 {
 		opts = append(opts, ttsfm.WithSpeed(req.Speed))
 	}
-
+	client, err := ttsfm.NewTTSClient(h.TTSClientOptions...)
+	if err != nil {
+		h.error("Failed to create TTS client: %v", err)
+		return
+	}
+	defer client.Close()
 	// 获取流式响应
-	streamResp, err := h.client.GenerateSpeechStream(ctx, req.Input, opts...)
+	streamResp, err := client.GenerateSpeechStream(ctx, req.Input, opts...)
 	if err != nil {
 		h.handleError(c, err)
 		return
@@ -216,14 +222,14 @@ func (h *Handler) handleShortTextStream(
 	h.info("Successfully streamed %d bytes of %s audio", written, streamResp.Format)
 }
 
-func (h *Handler) handleLongText(
+func (h *Handler) handleLongTextStream(
 	c *gin.Context,
 	ctx context.Context,
 	req *SpeechRequest,
 	voice ttsfm.Voice,
 	format ttsfm.AudioFormat,
 ) {
-	h.info("Long text detected (%d chars), auto-combining enabled", len(req.Input))
+	h.info("Long text detected (%d chars), auto-combining enabled (streaming)", len(req.Input))
 
 	opts := []ttsfm.RequestOption{
 		ttsfm.WithVoice(voice),
@@ -237,55 +243,52 @@ func (h *Handler) handleLongText(
 		opts = append(opts, ttsfm.WithSpeed(req.Speed))
 	}
 
-	responses, err := h.client.GenerateSpeechLongText(ctx, req.Input, req.MaxLength, true, opts...)
+	client, err := ttsfm.NewTTSClient(h.TTSClientOptions...)
+	if err != nil {
+		h.error("Failed to create TTS client: %v", err)
+		return
+	}
+	defer client.Close()
+
+	streamResp, err := client.GenerateSpeechLongTextStreamConcurrent(
+		ctx,
+		req.Input,
+		req.MaxLength,
+		true,
+		&ttsfm.LongTextStreamConfig{
+			MaxConcurrent:   3,
+			ChunkBufferSize: 32 * 1024,
+		},
+		opts...,
+	)
 	if err != nil {
 		h.handleError(c, err)
 		return
 	}
-	if len(responses) == 0 {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "No valid text chunks found",
-				Type:    "processing_error",
-				Code:    "no_chunks",
-			},
-		})
-		return
+	defer streamResp.Close()
+
+	chunksTotal := streamResp.Metadata["chunks_total"]
+	if strings.TrimSpace(chunksTotal) == "" {
+		chunksTotal = "0"
 	}
 
-	chunks := make([][]byte, 0, len(responses))
-	for _, r := range responses {
-		chunks = append(chunks, r.AudioData)
-	}
-
-	actualFormat := responses[0].Format
-	contentType := responses[0].ContentType
-
-	combinedAudio, err := ttsfm.CombineAudioChunks(chunks, actualFormat)
-	if err != nil {
-		h.error("Failed to combine audio chunks: %v", err)
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to combine audio chunks",
-				Type:    "processing_error",
-				Code:    "combine_failed",
-			},
-		})
-		return
-	}
-
-	h.info("Successfully combined %d chunks into single audio file", len(responses))
-
-	c.Header("Content-Type", contentType)
-	c.Header("Content-Length", strconv.Itoa(len(combinedAudio)))
-	c.Header("X-Audio-Format", string(actualFormat))
-	c.Header("X-Audio-Size", strconv.Itoa(len(combinedAudio)))
-	c.Header("X-Chunks-Combined", strconv.Itoa(len(responses)))
+	c.Header("Content-Type", streamResp.ContentType)
+	c.Header("Transfer-Encoding", "chunked")
+	c.Header("X-Audio-Format", string(streamResp.Format))
+	c.Header("X-Chunks-Combined", chunksTotal)
 	c.Header("X-Original-Text-Length", strconv.Itoa(len(req.Input)))
 	c.Header("X-Auto-Combine", "true")
 	c.Header("X-Powered-By", "TTSFM-OpenAI-Compatible")
 
-	c.Data(http.StatusOK, contentType, combinedAudio)
+	c.Status(http.StatusOK)
+
+	written, err := io.Copy(c.Writer, streamResp.Body)
+	if err != nil && !errors.Is(err, io.EOF) && err.Error() != "EOF" {
+		h.error("Error streaming long text response: %v (written %d bytes)", err, written)
+		return
+	}
+
+	h.info("Successfully streamed %d bytes of %s audio (chunks=%s)", written, streamResp.Format, chunksTotal)
 }
 
 func (h *Handler) handleError(c *gin.Context, err error) {

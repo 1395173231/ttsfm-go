@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"mime/multipart"
 	"strings"
 	"sync"
@@ -56,6 +57,25 @@ func DefaultClientConfig() *ClientConfig {
 		VerifySSL:     true,
 		MaxConcurrent: 10,
 		Logger:        &DefaultLogger{},
+	}
+}
+
+const defaultLongTextStreamMaxConcurrent = 3
+const defaultLongTextStreamChunkBufferSize = 32 * 1024
+
+// LongTextStreamConfig 长文本流式配置
+type LongTextStreamConfig struct {
+	// MaxConcurrent 单个长文本请求的最大并发数（默认 3）
+	MaxConcurrent int
+	// ChunkBufferSize 单个 chunk 的预读/拷贝缓冲大小（默认 32KB）
+	ChunkBufferSize int
+}
+
+// DefaultLongTextStreamConfig 默认配置
+func DefaultLongTextStreamConfig() *LongTextStreamConfig {
+	return &LongTextStreamConfig{
+		MaxConcurrent:   defaultLongTextStreamMaxConcurrent,
+		ChunkBufferSize: defaultLongTextStreamChunkBufferSize,
 	}
 }
 
@@ -121,13 +141,23 @@ func NewTTSClient(opts ...ClientOption) (*TTSClient, error) {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 1
 	}
-
 	jar := tls_client.NewCookieJar()
+
+	clientProfileList := []profiles.ClientProfile{
+		profiles.Safari_IOS_18_0,
+		profiles.Chrome_133,
+		profiles.Safari_IOS_17_0,
+		profiles.Chrome_131,
+		profiles.Firefox_135,
+		profiles.Safari_Ipad_15_6,
+	}
+	profile := clientProfileList[rand.Intn(len(clientProfileList))]
 	tlsOptions := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(timeoutSeconds),
-		tls_client.WithClientProfile(profiles.Safari_IOS_18_5),
+		tls_client.WithClientProfile(profile),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(jar),
+		tls_client.WithForceHttp1(),
 	}
 
 	if !config.VerifySSL {
@@ -285,29 +315,390 @@ func (c *TTSClient) GenerateSpeechLongText(
 	return c.GenerateSpeechBatch(ctx, requests)
 }
 
-// GenerateSpeechBatch 批量生成语音
+// GenerateSpeechLongTextStream 将长文本切分后按 chunk 顺序拉取上游音频流并拼接为一个连续流。
+// 相比 GenerateSpeechLongText/GenerateSpeechBatch：
+// - 不会把所有音频一次性读入内存（避免 io.ReadAll + [][]byte）
+// - 能更早向下游输出首段数据，降低等待时间
+func (c *TTSClient) GenerateSpeechLongTextStream(
+	ctx context.Context,
+	text string,
+	maxLength int,
+	preserveWords bool,
+	opts ...RequestOption,
+) (*TTSStreamResponse, error) {
+	cleanText, err := SanitizeText(text)
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := SplitTextByLength(cleanText, maxLength, preserveWords)
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("no valid text chunks found after processing")
+	}
+
+	firstReq, err := NewTTSRequest(chunks[0], append(opts, WithoutLengthValidation())...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for chunk 0: %w", err)
+	}
+
+	firstResp, err := c.GenerateSpeechFromRequestStream(ctx, firstReq)
+	if err != nil {
+		return nil, fmt.Errorf("chunk 0: %w", err)
+	}
+
+	pipeReader, pipeWriter := io.Pipe()
+
+	streamMeta := map[string]string{
+		"chunks_total": fmt.Sprintf("%d", len(chunks)),
+	}
+
+	out := &TTSStreamResponse{
+		Body:        pipeReader,
+		ContentType: firstResp.ContentType,
+		Format:      firstResp.Format,
+		Metadata:    streamMeta,
+	}
+
+	go func() {
+		defer pipeWriter.Close()
+
+		writeErr := func() error {
+			// chunk 0：完整写入（包含容器头/ID3）
+			_, err := io.Copy(pipeWriter, firstResp.Body)
+			_ = firstResp.Close()
+			if err != nil {
+				return err
+			}
+
+			// chunk >= 1：根据格式做“跳头/跳标签”处理
+			for i := 1; i < len(chunks); i++ {
+				req, err := NewTTSRequest(chunks[i], append(opts, WithoutLengthValidation())...)
+				if err != nil {
+					return fmt.Errorf("failed to create request for chunk %d: %w", i, err)
+				}
+
+				sr, err := c.GenerateSpeechFromRequestStream(ctx, req)
+				if err != nil {
+					return fmt.Errorf("chunk %d: %w", i, err)
+				}
+
+				var copyErr error
+				switch out.Format {
+				case FormatMP3:
+					_, copyErr = CopyMP3Stream(pipeWriter, sr.Body, true)
+				case FormatWAV:
+					_, copyErr = CopyWAVDataStream(pipeWriter, sr.Body)
+				default:
+					_, copyErr = io.Copy(pipeWriter, sr.Body)
+				}
+
+				_ = sr.Close()
+				if copyErr != nil {
+					return fmt.Errorf("chunk %d copy: %w", i, copyErr)
+				}
+			}
+
+			return nil
+		}()
+
+		if writeErr != nil {
+			_ = pipeWriter.CloseWithError(writeErr)
+		}
+	}()
+
+	return out, nil
+}
+
+// GenerateSpeechLongTextStreamConcurrent 并发流式处理长文本（按序输出，流式零 ReadAll，小缓存）
+//
+// - 为单个长文本请求限制并发数（默认 3）
+// - 输出严格按原 chunk 顺序
+// - worker 侧将上游响应流写入各自的 io.Pipe，天然背压保证不会在内存中堆积完整音频
+func (c *TTSClient) GenerateSpeechLongTextStreamConcurrent(
+	ctx context.Context,
+	text string,
+	maxLength int,
+	preserveWords bool,
+	config *LongTextStreamConfig,
+	opts ...RequestOption,
+) (*TTSStreamResponse, error) {
+	if config == nil {
+		config = DefaultLongTextStreamConfig()
+	}
+
+	bufSize := config.ChunkBufferSize
+	if bufSize <= 0 {
+		bufSize = defaultLongTextStreamChunkBufferSize
+	}
+
+	cleanText, err := SanitizeText(text)
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := SplitTextByLength(cleanText, maxLength, preserveWords)
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("no valid text chunks found after processing")
+	}
+
+	if len(chunks) == 1 {
+		req, err := NewTTSRequest(chunks[0], append(opts, WithoutLengthValidation())...)
+		if err != nil {
+			return nil, err
+		}
+		return c.GenerateSpeechFromRequestStream(ctx, req)
+	}
+
+	maxConc := config.MaxConcurrent
+	if maxConc <= 0 {
+		maxConc = defaultLongTextStreamMaxConcurrent
+	}
+	if maxConc > len(chunks) {
+		maxConc = len(chunks)
+	}
+	// 同时也要受全局并发限制（semaphore）约束，避免死锁
+	if c.config != nil && c.config.MaxConcurrent > 0 && maxConc > c.config.MaxConcurrent {
+		maxConc = c.config.MaxConcurrent
+	}
+	if maxConc <= 0 {
+		maxConc = 1
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	type chunkPipe struct {
+		r *io.PipeReader
+		w *io.PipeWriter
+	}
+
+	pipes := make([]chunkPipe, len(chunks))
+	for i := 1; i < len(chunks); i++ {
+		pr, pw := io.Pipe()
+		pipes[i] = chunkPipe{r: pr, w: pw}
+	}
+
+	// 先发 chunk0：输出必须包含第一个 chunk 的容器头/ID3
+	firstReq, err := NewTTSRequest(chunks[0], append(opts, WithoutLengthValidation())...)
+	if err != nil {
+		cancel()
+		for i := 1; i < len(chunks); i++ {
+			_ = pipes[i].r.Close()
+		}
+		return nil, fmt.Errorf("failed to create request for chunk 0: %w", err)
+	}
+
+	firstResp, err := c.GenerateSpeechFromRequestStream(ctx, firstReq)
+	if err != nil {
+		cancel()
+		for i := 1; i < len(chunks); i++ {
+			_ = pipes[i].r.Close()
+		}
+		return nil, fmt.Errorf("chunk 0: %w", err)
+	}
+
+	outReader, outWriter := io.Pipe()
+
+	out := &TTSStreamResponse{
+		Body:        outReader,
+		ContentType: firstResp.ContentType,
+		Format:      firstResp.Format,
+		Metadata: map[string]string{
+			"chunks_total": fmt.Sprintf("%d", len(chunks)),
+			"concurrency":  fmt.Sprintf("%d", maxConc),
+		},
+	}
+
+	var bufPool sync.Pool
+	bufPool.New = func() any { return make([]byte, bufSize) }
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	workerCount := maxConc
+	if workerCount > len(chunks)-1 {
+		workerCount = len(chunks) - 1
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	wg.Add(workerCount)
+	for w := 0; w < workerCount; w++ {
+		// GenerateSpeechLongTextStreamConcurrent 中的 worker 部分
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+
+				pw := pipes[idx].w
+				if pw == nil {
+					cancel()
+					return
+				}
+
+				req, err := NewTTSRequest(chunks[idx], append(opts, WithoutLengthValidation())...)
+				if err != nil {
+					_ = pw.CloseWithError(fmt.Errorf("failed to create request for chunk %d: %w", idx, err))
+					cancel()
+					return
+				}
+
+				sr, err := c.GenerateSpeechFromRequestStream(ctx, req)
+				if err != nil {
+					_ = pw.CloseWithError(fmt.Errorf("chunk %d: %w", idx, err))
+					cancel()
+					return
+				}
+
+				buf := bufPool.Get().([]byte)
+
+				var copyErr error
+				// 使用实际返回的格式，而不是 out.Format
+				switch sr.Format {
+				case FormatMP3:
+					_, copyErr = CopyMP3StreamWithBuffer(pw, sr.Body, true, buf)
+				case FormatWAV:
+					_, copyErr = CopyWAVDataStreamWithBuffer(pw, sr.Body, buf)
+				default:
+					_, copyErr = io.CopyBuffer(pw, sr.Body, buf)
+				}
+
+				bufPool.Put(buf)
+				_ = sr.Close()
+
+				if copyErr != nil {
+					_ = pw.CloseWithError(fmt.Errorf("chunk %d copy: %w", idx, copyErr))
+					cancel()
+					return
+				}
+
+				_ = pw.Close()
+			}
+		}()
+
+	}
+
+	go func() {
+		defer close(jobs)
+		for i := 1; i < len(chunks); i++ {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		fail := func(err error) {
+			_ = outWriter.CloseWithError(err)
+			cancel()
+			for i := 1; i < len(chunks); i++ {
+				if pipes[i].r != nil {
+					_ = pipes[i].r.Close()
+				}
+			}
+		}
+
+		defer func() {
+			cancel()
+			wg.Wait()
+			_ = outWriter.Close()
+		}()
+
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
+		// 写 chunk0（完整输出）
+		_, err := io.CopyBuffer(outWriter, firstResp.Body, buf)
+		_ = firstResp.Close()
+		if err != nil {
+			fail(fmt.Errorf("chunk 0 write: %w", err))
+			return
+		}
+
+		// 按序写 chunk1..n
+		for i := 1; i < len(chunks); i++ {
+			if pipes[i].r == nil {
+				fail(fmt.Errorf("chunk %d pipe missing", i))
+				return
+			}
+			_, err := io.CopyBuffer(outWriter, pipes[i].r, buf)
+			_ = pipes[i].r.Close()
+			if err != nil {
+				fail(fmt.Errorf("chunk %d write: %w", i, err))
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// GenerateSpeechBatch 批量生成语音（受限并发 worker pool）
+//
+// 旧实现会为每个 request 启动一个 goroutine；当 requests 很多时会造成 goroutine 数暴涨，
+// 并且一旦 resp.Body 被 io.ReadAll，内存峰值=并发数×单段音频大小。
+// 这里使用固定 worker 数（<= MaxConcurrent）来限制并发与瞬时内存压力。
 func (c *TTSClient) GenerateSpeechBatch(ctx context.Context, requests []*TTSRequest) ([]*TTSResponse, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
 
+	workerCount := c.config.MaxConcurrent
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if workerCount > len(requests) {
+		workerCount = len(requests)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type job struct {
+		index   int
+		request *TTSRequest
+	}
+
+	jobs := make(chan job)
 	responses := make([]*TTSResponse, len(requests))
 	errs := make([]error, len(requests))
 
 	var wg sync.WaitGroup
-	wg.Add(len(requests))
+	wg.Add(workerCount)
+
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				resp, err := c.GenerateSpeechFromRequest(ctx, j.request)
+				if err != nil {
+					errs[j.index] = err
+					cancel()
+					return
+				}
+				responses[j.index] = resp
+			}
+		}()
+	}
 
 	for i, req := range requests {
-		go func(idx int, request *TTSRequest) {
-			defer wg.Done()
-			resp, err := c.GenerateSpeechFromRequest(ctx, request)
-			if err != nil {
-				errs[idx] = err
-				return
-			}
-			responses[idx] = resp
-		}(i, req)
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case jobs <- job{index: i, request: req}:
+		case <-ctx.Done():
+			break
+		}
 	}
+	close(jobs)
 
 	wg.Wait()
 
@@ -418,10 +809,14 @@ func (c *TTSClient) makeStreamRequest(ctx context.Context, request *TTSRequest) 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
+		if request.ResponseFormat == FormatMP3 {
+			req.Header.Set("Accept", "audio/mpeg")
+		} else {
+			req.Header.Set("Accept", "application/json, audio/*, */*;q=0.9")
+		}
 
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-		req.Header.Set("Accept", "application/json, audio/*")
 
 		if c.config.APIKey != "" {
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.config.APIKey))
